@@ -1,0 +1,210 @@
+name: Transform JAR to APK Compiler
+
+on:
+  workflow_dispatch: # Allows you to run this manually from GitHub
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/uses/checkout@v4
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Bootstrap Android Project Skeleton
+      run: |
+        echo "Creating Android project directories..."
+        mkdir -p app/src/main/java/com/wrapper/terminal
+        mkdir -p app/src/main/res/layout
+        mkdir -p app/libs
+
+    - name: Create build.gradle Configuration
+      run: |
+        cat << 'EOF' > build.gradle
+        buildscript {
+            repositories { google(); mavenCentral() }
+            dependencies { classpath 'com.android.tools.build:gradle:8.2.2' }
+        }
+        allprojects {
+            repositories { google(); mavenCentral() }
+        }
+        EOF
+
+    - name: Create App-Level build.gradle
+      run: |
+        cat << 'EOF' > app/build.gradle
+        plugins {
+            id 'com.android.application'
+        }
+
+        android {
+            namespace 'com.wrapper.terminal'
+            compileSdk 34
+
+            defaultConfig {
+                applicationId "com.wrapper.terminal"
+                minSdk 26
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+            }
+
+            buildTypes {
+                release {
+                    minifyEnabled false
+                }
+            }
+        }
+
+        dependencies {
+            // This line tells Gradle to automatically dex and embed your fat JAR
+            implementation fileTree(dir: 'libs', include: ['*.jar'])
+            implementation 'androidx.appcompat:appcompat:1.6.1'
+            implementation 'com.google.android.material:material:1.11.0'
+        }
+        EOF
+
+    - name: Create Android Manifest
+      run: |
+        cat << 'EOF' > app/src/main/AndroidManifest.xml
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:allowBackup="true"
+                android:label="APKEditor Mobile Terminal"
+                android:theme="@style/Theme.AppCompat.NoActionBar">
+                <activity android:name=".MainActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+    - name: Create Terminal UI Layout
+      run: |
+        cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+        <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:background="#121212"
+            android:padding="16dp">
+
+            <EditText
+                android:id="@+id/cmdInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Enter arguments (e.g., d -i app.apk)"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#888888" />
+
+            <Button
+                android:id="@+id/runBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Execute JAR Main" />
+
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_marginTop="10dp"
+                android:background="#000000">
+                <TextView
+                    android:id="@+id/consoleOutput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#00FF00"
+                    android:fontFamily="monospace"
+                    android:text="--- Terminal Initialized ---\n" />
+            </ScrollView>
+        </LinearLayout>
+        EOF
+
+    - name: Create Bridge Code (MainActivity.java)
+      run: |
+        cat << 'EOF' > app/src/main/java/com/wrapper/terminal/MainActivity.java
+        package com.wrapper.terminal;
+
+        import android.os.Bundle;
+        import android.widget.Button;
+        import android.widget.EditText;
+        import android.widget.TextView;
+        import androidx.appcompat.app.AppCompatActivity;
+        import java.io.OutputStream;
+        import java.io.PrintStream;
+        import java.lang.reflect.Method;
+
+        public class MainActivity extends AppCompatActivity {
+            private TextView console;
+            private EditText input;
+
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+                super.onCreate(savedInstanceState);
+                setContentView(R.layout.activity_main);
+
+                console = findViewById(R.id.consoleOutput);
+                input = findViewById(R.id.cmdInput);
+                Button runBtn = findViewById(R.id.runBtn);
+
+                // Redirect standard output streams to the TextView console
+                OutputStream out = new OutputStream() {
+                    @Override
+                    public void write(int b) {
+                        runOnUiThread(() -> console.append(String.valueOf((char) b)));
+                    }
+                };
+                System.setOut(new PrintStream(out));
+                System.setErr(new PrintStream(out));
+
+                runBtn.setOnClickListener(v -> {
+                    String[] args = input.getText().toString().split(" ");
+                    executeJarMain(args);
+                });
+            }
+
+            private void executeJarMain(String[] args) {
+                new Thread(() -> {
+                    try {
+                        runOnUiThread(() -> console.append("\n> Running APKEditor...\n"));
+                        // Uses reflection to find and invoke the JAR's entry point
+                        Class<?> clazz = Class.forName("b3nac.apkeditor.APKEditor");
+                        Method mainMethod = clazz.getMethod("main", String[].class);
+                        mainMethod.invoke(null, (Object) args);
+                    } catch (Exception e) {
+                        final String error = e.toString();
+                        runOnUiThread(() -> console.append("\nExecution Error: " + error + "\n"));
+                    }
+                }).start();
+            }
+        }
+        EOF
+
+    - name: Fetch and Inject the Fat JAR
+      run: |
+        # Pulls the target v1.4.9 jar into the compile path libs folder
+        curl -L "https://github.com/REAndroid/APKEditor/releases/download/v1.4.9/APKEditor-1.4.9.jar" -o app/libs/APKEditor-1.4.9.jar
+        echo "JAR injected into Android compile pipeline."
+
+    - name: Initialize Gradle Wrapper
+      run: gradle wrapper --gradle-version 8.5
+
+    - name: Compile Project to APK
+      run: ./gradlew assembleDebug
+
+    - name: Upload Finished APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Native-JAR-Wrapper-APK
+        path: app/build/outputs/apk/debug/app-debug.apk
